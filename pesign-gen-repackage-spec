@@ -647,6 +647,12 @@ for my $p (values(%packages)) {
 $kmp_basename = $main_name unless $kmp_basename;
 
 open(SPEC, '>', "$output/repackage.spec") or die "$output/repackage.spec: $!\n";
+print SPEC <<"EOF";
+%if 0%{?fedora} || 0%{?rhel_version} || 0%{?centos_version}
+%global debug_package %{nil}
+%endif
+
+EOF
 print_package($packages{$main_name}, 1);
 for my $name (sort(keys(%packages))) {
 	next if $name eq $main_name;
@@ -682,7 +688,7 @@ if ($cert_subpackage) {
 print SPEC <<"EOF";
 %if "%buildroot" != "$directory"
 %build
-rmdir %buildroot
+rmdir %buildroot || true
 ln -sf $directory %buildroot
 %{?_top_builddir:%global buildsubdir ..}
 %endif

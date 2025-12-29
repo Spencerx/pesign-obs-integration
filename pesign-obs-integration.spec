@@ -17,7 +17,7 @@
 # needssslcertforbuild
 
 
-%if 0%{?fedora}
+%if 0%{?fedora} || 0%{?rhel_version} || 0%{?centos_version}
 %global debug_package %{nil}
 %endif
 
