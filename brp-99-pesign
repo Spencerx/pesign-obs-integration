@@ -116,6 +116,32 @@ if [ -n "$POSTFIX_MAP_STR" ]; then
     echo "Memory-based Postfix Map generated: $POSTFIX_MAP_STR"
 fi
 
+# Support RemovePathPostFixes, relocating files into Package-named folder. e.g.
+# copy /usr/share/toto/systemd-bootx64.efi.standalone
+# to /toto-standalone/usr/share/toto/systemd-bootx64.efi
+# Then we will package the copy to RPM_PACKAGE_NAME.cpio.rsasign archive
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    # Each entry in map string is pkg_name:p_suffix
+    for entry in $POSTFIX_MAP_STR; do
+	p_name="${entry%%:*}"
+        p_suffix="${entry#*:}"
+	# Search all files with p_suffix. e.g. .standalone
+        find "$RPM_BUILD_ROOT" -type f -name "*$p_suffix" | while read -r src_file; do
+	    # Remove the original p_suffix as new file name for copy
+            # e.g. /.../systemd-bootx64.efi.standalone -> /.../systemd-bootx64.efi
+            target_base_path="${src_file%$p_suffix}"
+	    rel_path="${target_base_path#$RPM_BUILD_ROOT}"
+	    # Add a new p_name folder behine buildroot
+            # e.g. BUILD_ROOT/usr/share/toto/ -> BUILD_ROOT/toto-standalone/usr/share/toto/
+	    target_file="$RPM_BUILD_ROOT/${p_name}${rel_path}"
+	    target_dir=$(dirname "$target_file")
+            # Run copy
+            mkdir -p "$target_dir"
+            cp -a "$src_file" "$target_file"
+        done
+    done
+fi
+
 case "$BRP_PESIGN_GRUB_RESERVATION" in
 	'')
 		pesign_grub_reservation="0"
@@ -153,6 +179,7 @@ else
 fi
 
 pushd "$RPM_BUILD_ROOT"
+# Producing the arguments of find command to pick files to .cpio.rsasign archive
 args=()
 for pattern in $files; do
 	pattern=${pattern#/}
@@ -162,7 +189,33 @@ for pattern in $files; do
 	if test -d "$pattern"; then
 		pattern="$pattern/*"
 	fi
-	args=("${args[@]}" -o -path "$pattern")
+	# Support RemovePathPostFixes, check the pattern matches with any
+	# suffix in Postfix Map file. If so, then we package the copy file
+	# in /pkg_name to $RPM_PACKAGE_NAME.cpio.rsasign archive. e.g.
+	# /toto-standalone/usr/share/toto/systemd-bootx64.efi
+	# instead of
+	# /usr/share/toto/systemd-bootx64.efi.standalone
+        shifted_match=""
+	if [ -n "$POSTFIX_MAP_STR" ]; then
+	    for entry in $POSTFIX_MAP_STR; do
+		p_name="${entry%%:*}"
+		p_suffix="${entry#*:}"
+		# If current pattern matches with suffix
+		if [[ "$pattern" == *"$p_suffix" ]]; then
+		    base_path="${pattern%$p_suffix}"
+		    rel_base_path="${base_path#./}"
+		    shifted_match="./${p_name}/${rel_base_path}"
+                    break
+		fi
+	    done
+	fi
+        if [ -z "$shifted_match" ]; then
+	    # Case A: no match, keep using original file pattern
+            args=("${args[@]}" -o -path "$pattern")
+        else
+	    # Case B: match, using shifted match pattern
+            args=("${args[@]}" -o -path "$shifted_match")
+        fi
 done
 # delete the leading -o
 unset args[0]
@@ -202,11 +255,25 @@ if [ "$nfiles" != 0 ] ; then
 fi
 rm -rf "$archive_dir"
 
+# Removing temporary suffix package folders and its files before primary build
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    for entry in $POSTFIX_MAP_STR; do
+	p_name="${entry%%:*}"
+	# Delete the $p_name/ folder located directly under the build root
+	find "$RPM_BUILD_ROOT" -maxdepth 1 -type d -name "${p_name}" -exec rm -rf {} +
+    done
+fi
+
 if [ "$nfiles" = 0 ] ; then
 echo "No files in $archive, giving up"
 	exit 0
 fi
 popd
+
+# Show the content in .cpio.rsasign archive for debugging
+if [ -f "$archive" ]; then
+    cpio -it < "$archive" | sed 's/^/DEBUG: [CPIO] /'
+fi
 
 if test -e $RPM_SOURCE_DIR/pesign-spec-macros; then
 	sed "
