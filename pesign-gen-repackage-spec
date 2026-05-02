@@ -34,6 +34,8 @@ my $cert_subpackage;
 my $kmp_basename;
 my $compress = "";
 my $macros_file = "";
+my $rpp_pkgs_list = "";
+my %rpp_lookup = ();
 my @rpms;
 
 $ENV{LC_ALL} = "en_US.UTF-8";
@@ -45,6 +47,7 @@ GetOptions(
 	"cert-subpackage|c=s" => \$cert_subpackage,
 	"compress|C=s" => \$compress,
 	"macros|M=s" => \$macros_file,
+	"rpp-pkgs:s" => \$rpp_pkgs_list,
 ) or die $USAGE;
 @rpms = @ARGV;
 if (!@rpms) {
@@ -55,6 +58,15 @@ if (!$directory || substr($directory, 0, 1) ne '/' || ! -d $directory) {
 	print STDERR "$0: --directory must be an absolute path\n";
 	die $USAGE;
 }
+# Transfer RPP package list from CSV to Hash for later usage
+if ($rpp_pkgs_list) {
+    %rpp_lookup = map { $_ => 1 } split(',', $rpp_pkgs_list);
+}
+print "--- rpp_lookup content ---\n";
+foreach my $key (sort keys %rpp_lookup) {
+    print "$key => $rpp_lookup{$key}\n";
+}
+print "----------------------------------\n";
 
 sub query_array {
 	my ($rpm, @tags) = @_;

@@ -66,6 +66,56 @@ if ! mkdir -p "$output"; then
 	exit 0
 fi
 
+# Handing RemovePathPostFixes
+# Scanning for spec files and parsing package/subpackage names, RemovePathPostFixes
+# Producing pkg_name:RemovePathPostFixes_suffix mapping string for later usage
+SOURCE_DIR=$(rpm --eval '%{_sourcedir}')
+SPEC_LIST=$(find "$SOURCE_DIR" -maxdepth 1 -name "*.spec" 2>/dev/null || :)
+if [ -z "$SPEC_LIST" ]; then
+    # If can not find any spec in _sourcedir, fallback here
+    SPEC_LIST=$(find ../../../rpmbuild/SOURCES -maxdepth 1 -name "*.spec" 2>/dev/null || :)
+fi
+# pkg_name:rpp_suffix mapping string: "pkg-A:.suffixA pkg-B:.suffixB"
+POSTFIX_MAP_STR=""
+if [ -z "$SPEC_LIST" ]; then
+    echo "No spec files found. RemovePaathPostFixes mapping failed."
+else
+    for spec in $SPEC_LIST; do
+	# Using awk for parsing spec file
+	# Name: main_pkg
+	# %package: p_name
+	# 	- without -n, p_name = main_pkg-$2
+	# RemovePathPostfixes: p_suffix
+	mappings=$(awk '{
+            cmd = toupper($1)
+            if (cmd == "NAME:") {
+                main_pkg = $2
+                current_pkg = main_pkg
+            }
+            else if (cmd == "%PACKAGE") {
+                if ($2 == "-n") {
+                    current_pkg = $3
+                } else {
+                    current_pkg = main_pkg "-" $2
+                }
+            }
+            else if (cmd == "REMOVEPATHPOSTFIXES:") {
+                print current_pkg ":" $2
+            }
+        }' "$spec")
+	if [ -n "$mappings" ]; then
+	    # attach new mapping entry to string
+            POSTFIX_MAP_STR="$POSTFIX_MAP_STR $mappings"
+        fi
+    done
+fi
+# Remove leading and trailing whitespace
+POSTFIX_MAP_STR=$(echo $POSTFIX_MAP_STR | xargs)
+# Print postfix map string
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    echo "Memory-based Postfix Map generated: $POSTFIX_MAP_STR"
+fi
+
 case "$BRP_PESIGN_GRUB_RESERVATION" in
 	'')
 		pesign_grub_reservation="0"
@@ -179,6 +229,12 @@ if test -e $RPM_SOURCE_DIR/pesign-copy-sources; then
 	rm $output/pesign-copy-sources
 fi
 
+# Collect all RemovePathPostFixes (RPP) pkg_names for sending to next stage
+RPP_PACKAGES=""
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    RPP_PACKAGES=$(echo "$POSTFIX_MAP_STR" | awk 'BEGIN{RS=" "; FS=":"} {print $1}' | xargs)
+fi
+echo "RPP_PACKAGES: $RPP_PACKAGES"
 
 sed "
 	s:@NAME@:$RPM_PACKAGE_NAME:g
@@ -186,6 +242,7 @@ sed "
 	s:@PESIGN_REPACKAGE_COMPRESS@:$pesign_repackage_compress:g
 	s:@PESIGN_LOAD_SPEC_MACROS@:$spec_macros:g
 	s:@PESIGN_PACKAGES@:$packages:g
+	s:@RPP_PACKAGES@:$RPP_PACKAGES:g
 	/@CERT@/ {
 		r $cert
 		d

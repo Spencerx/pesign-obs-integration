@@ -52,6 +52,10 @@ Spec file to rebuild RPMs with signatures
 # avoid loops
 export BRP_PESIGN_FILES=""
 
+RPP_rpms=(@RPP_PACKAGES@)
+echo "Extracted RemovePathPostFixes packages array:"
+declare -p RPP_rpms
+
 pushd %buildroot
 disturl=
 rpms_filter=@PESIGN_PACKAGES@
@@ -233,9 +237,12 @@ done
 # Remove the public key file
 rm "$cert.pub"
 
+# Transfer RPP rpms array to CSV string for pesign-gen-repackage-spec perl script
+RPP_PKGS=$(IFS=,; echo "${RPP_rpms[*]}")
+
 popd
 /usr/lib/rpm/pesign/pesign-gen-repackage-spec @PESIGN_REPACKAGE_COMPRESS@ @PESIGN_LOAD_SPEC_MACROS@ \
-	--directory=%buildroot "${rpms[@]}"
+	--directory=%buildroot --rpp-pkgs="$RPP_PKGS" "${rpms[@]}"
 
 # For some reason in Fedora/CentOS builds the directory structure is different from SUSE,
 # which breaks repacking. Copy the package content to the buildroot that is actually used.
