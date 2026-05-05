@@ -74,6 +74,7 @@ rpmdir=RPMS
 srpmdir=SRPMS
 disturl=
 rpms=()
+RPP_PKGS=""
 rm -rf "$workdir"
 mkdir "$workdir" || exit
 mkdir -p "$rpmdir" "$srpmdir" || exit
@@ -104,7 +105,18 @@ for rpm; do
 		cp "$rpm" "$_"
 		continue
 	esac
-	rpm2cpio "$rpm" | (cd "$buildroot"; cpio -idm --quiet) || exit
+	# To avoid conflict with duplicate installed file use suffix and
+	# RemovePathPostfixes from RPM macros. We direct use pkg_name as
+	# the RemovePathPostfixes suffix. In the later, the RemovePathPostfixes
+	# in repackage.spec will handle it when repackaging.
+	pkg_name=$(rpm -qp --qf '%{name}' "$rpm")
+	mkdir -p "$workdir/tmp_extract"
+	rpm2cpio "$rpm" | cpio -idm -D "$workdir/tmp_extract" --quiet || exit
+	find "$workdir/tmp_extract" -depth ! -type d -print0 | while IFS= read -r -d '' f; do
+		mv "$f" "${f}.${pkg_name}"
+	done
+	cp -a "$workdir/tmp_extract"/. "$buildroot/"
+	rm -rf "$workdir/tmp_extract"
 	d=$(rpm -qp --qf '%{disturl}' "$rpm")
 	if test -z "$disturl"; then
 		disturl=$d
@@ -114,20 +126,29 @@ for rpm; do
 		exit 1
 	fi
 	rpms=("${rpms[@]}" "$rpm")
+	# Put all package name to RPP_PKGS string for pesign-gen-repackage-spec
+	# In local signing/repackaging situation, we treat all packages as RPP
+	# (RemovePathPostFixes) packages to avoid file conflict.
+	if [ -z "$RPP_PKGS" ]; then
+		RPP_PKGS="$pkg_name"
+	else
+		RPP_PKGS="$RPP_PKGS,$pkg_name"
+	fi
 done
 set -e
 echo "Signing kernel modules..."
 if test ! -e "$cert.pub"; then
 	openssl x509 -in "$cert" -inform DER -pubkey -noout > "$cert.pub"
 fi
-for module in $(find "$buildroot" -type f -name '*.ko' -printf '%P\n'); do
+for module in $(find "$buildroot" -type f -name '*.ko.*' -printf '%P\n'); do
+	orig_module=$(echo "$module" | sed -r 's/\.ko\.[^/]+$/.ko/')
 	if test -n "$key"; then
 		/usr/lib/rpm/pesign/kernel-sign-file \
 			-i pkcs7 sha256 "$key" "$cert" "$buildroot/$module"
 	else
-		raw_sig="$sig_dir/$module.sig"
+		raw_sig="$sig_dir/$orig_module.sig"
 		if test ! -e "$raw_sig"; then
-			echo "$module.sig not found in $sig_dir" >&2
+			echo "$orig_module.sig not found in $sig_dir" >&2
 			exit 1
 		fi
 		ver_err=$(openssl rsautl -verify -inkey "$cert.pub" -pubin -in "$raw_sig" 2>&1 | grep -i error)
@@ -156,7 +177,7 @@ if ! test -e /usr/lib/rpm/kernel-cert-subpackage; then
 fi
 /usr/lib/rpm/pesign/pesign-gen-repackage-spec \
 	--cert-subpackage=/usr/lib/rpm/kernel-cert-subpackage \
-	--directory="$buildroot" --output="$workdir" "${rpms[@]}"
+	--directory="$buildroot" --output="$workdir" --rpp-pkgs="$RPP_PKGS" "${rpms[@]}"
 echo "Running rpmbuild..."
 rpmbuild --define "buildroot $buildroot" --define "disturl $disturl" \
 	--define "_builddir $workdir" \
