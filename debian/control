@@ -2,7 +2,7 @@ Source: pesign-obs-integration
 Section: devel
 Priority: optional
 Maintainer: Michal Marek <mmarek@suse.cz>
-Build-Depends: debhelper (>= 7), openssl, shellcheck
+Build-Depends: debhelper (>= 7), openssl, shellcheck [!i386]
 Standards-Version: 3.9.8
 
 Package: pesign-obs-integration

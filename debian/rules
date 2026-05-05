@@ -25,4 +25,7 @@ override_dh_install:
 	fi
 
 override_dh_auto_test:
-	shellcheck dh_signobs
+	# shellcheck is not available anymore on Ubuntu i386
+	if command -v shellcheck >/dev/null; then \
+		shellcheck dh_signobs; \
+	fi
