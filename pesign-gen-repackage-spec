@@ -34,6 +34,8 @@ my $cert_subpackage;
 my $kmp_basename;
 my $compress = "";
 my $macros_file = "";
+my $rpp_pkgs_list = "";
+my %rpp_lookup = ();
 my @rpms;
 
 $ENV{LC_ALL} = "en_US.UTF-8";
@@ -45,6 +47,7 @@ GetOptions(
 	"cert-subpackage|c=s" => \$cert_subpackage,
 	"compress|C=s" => \$compress,
 	"macros|M=s" => \$macros_file,
+	"rpp-pkgs:s" => \$rpp_pkgs_list,
 ) or die $USAGE;
 @rpms = @ARGV;
 if (!@rpms) {
@@ -55,6 +58,15 @@ if (!$directory || substr($directory, 0, 1) ne '/' || ! -d $directory) {
 	print STDERR "$0: --directory must be an absolute path\n";
 	die $USAGE;
 }
+# Transfer RPP package list from CSV to Hash for later usage
+if ($rpp_pkgs_list) {
+    %rpp_lookup = map { $_ => 1 } split(',', $rpp_pkgs_list);
+}
+print "--- rpp_lookup content ---\n";
+foreach my $key (sort keys %rpp_lookup) {
+    print "$key => $rpp_lookup{$key}\n";
+}
+print "----------------------------------\n";
 
 sub query_array {
 	my ($rpm, @tags) = @_;
@@ -345,9 +357,13 @@ sub print_package {
 	}
 	print SPEC "\%define _binary_payload $payloadstr\n";
 
+	my $has_rpp = $rpp_lookup{$p->{name}} // 0;
 	if ($is_main) {
 		print SPEC "\%{load:\%_sourcedir/$macros_file}\n" if $macros_file ne "";
 		print SPEC "Name: $p->{name}\n";
+		if ($has_rpp) {
+			print SPEC "RemovePathPostfixes: .$p->{name}\n";
+		}
 		print SPEC "Buildroot: $directory\n";
 		if ($p->{nosource}) {
 			# We do not generate any no(src).rpm, but we want the
@@ -358,6 +374,9 @@ sub print_package {
 		}
 	} else {
 		print SPEC "\%package -n $p->{name}\n";
+		if ($has_rpp) {
+			print SPEC "RemovePathPostfixes: .$p->{name}\n";
+		}
 	}
 	for my $tag (@simple_tags) {
 		next if $p->{$tag} eq "";
@@ -408,7 +427,7 @@ sub print_package {
 	}
 	if ($p->{files}) {
 		print SPEC "\%files -n $p->{name}\n";
-		print_files($p->{files});
+		print_files($p->{name}, $p->{files});
 	}
 	print SPEC "\n";
 }
@@ -491,6 +510,7 @@ my %verifyflags = (
 );
 
 sub print_files {
+	my $pkg_name = shift;
 	my $files = shift;
 	my @tocompress;
 	my $compress_ext = "";
@@ -509,11 +529,24 @@ sub print_files {
 		$compress_cmd = "zstd -T0 --rm -f -q";
 	}
 
+	# If files are in RPP (RemovePathPostFixes) pacakge
+        my $has_rpp = $rpp_lookup{$pkg_name} // 0;
+
 	for my $f (@$files) {
-		my $path = "$directory/$f->{name}";
+		# Put the .pkg_name as the last suffix when the file is:
+		#   Not a directory
+		#   and Not in main package
+		#   and In a RPP pacakge
+		# e.g. /usr/lib/modules/vmlinuz.toto-standalone
+		# The RemovePathPostfixes in repackage.spec will remove
+		# .pkg_name suffix when repackaging RPMs
+		my $is_dir = S_ISDIR($f->{mode});
+		my $suffix = (!$is_dir && $has_rpp) ? ".$pkg_name" : "";
+		my $suffixed_name = $f->{name} . $suffix;
+		my $path = "$directory/$suffixed_name";
 		my $attrs = "";
 		# Fix mtime of directories, which cpio -idm fails to preserve
-		if (S_ISDIR($f->{mode})) {
+		if ($is_dir) {
 			$attrs .= "\%dir ";
 			utime($f->{mtime}, $f->{mtime}, $path);
 		}
@@ -576,13 +609,24 @@ sub print_files {
 			chmod($f->{mode}, $path);
 			utime($f->{mtime}, $f->{mtime}, $path);
 			push(@tocompress, $path);
-			print SPEC "$attrs " . quote_fn($f->{name} . $compress_ext) . "\n";
+                        my $final_name = $f->{name} . $compress_ext;
+			# If the ko file is in RPP package, add .pkg_name suffix in the end
+                        # e.g. driver.ko.zst.pkg_name
+                        $final_name .= "." . $pkg_name if $has_rpp;
+                        print SPEC "$attrs " . quote_fn($final_name) . "\n";
 		} else {
-			print SPEC "$attrs " . quote_fn($f->{name}) . "\n";
+			# non-ko file
+			print SPEC "$attrs " . quote_fn($suffixed_name) . "\n";
 		}
-
-		if (-e "$path.sig") {
-			print SPEC "$attrs " . quote_fn($f->{name} . ".sig") . "\n";
+		# Handle the signature exists as a separate .sig file
+		# (e.g., driver.ko corresponds to driver.ko.sig)
+		# For modsign-repackage?
+		my $sig_name = $f->{name} . ".sig";
+		# Special handle RPP files
+		my $sig_suffix = (!$is_dir && $has_rpp) ? ".$pkg_name" : "";
+                my $suffixed_sig_name = $sig_name . $sig_suffix;
+		if (-e "$directory/$suffixed_sig_name") {
+			print SPEC "$attrs " . quote_fn($suffixed_sig_name) . "\n";
 		}
 	}
 
@@ -592,6 +636,22 @@ sub print_files {
 		print M join("\n", @tocompress);
 		close(M);
 		system("xargs -a $m -t -P 4 -n 1 $compress_cmd");
+		# After file is compressed, handling RPP file
+                if ($has_rpp) {
+		    # Move pkg_name suffix to the tail of file name after ko be compressed
+		    foreach my $suffixed_path (@tocompress) {
+		        # suffixed path: /.../driver.ko.kernel-default
+		        # current filename: /.../driver.ko.kernel-default.zst
+		        # Before RemovePathPostfixes, we want: /.../driver.ko.zst.kernel-default
+		        my $current_file = $suffixed_path . $compress_ext;
+		        if (-e $current_file) {
+			    # rename driver.ko.pkg_name.zst to driver.ko.zst.pkg_name
+			    my $new_file = $current_file;
+			    $new_file =~ s/\.${pkg_name}${compress_ext}$/${compress_ext}.${pkg_name}/;
+			    rename($current_file, $new_file);
+		        }
+		    }
+		}
 		unlink($m);
 	}
 }

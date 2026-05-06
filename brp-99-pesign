@@ -66,6 +66,82 @@ if ! mkdir -p "$output"; then
 	exit 0
 fi
 
+# Handing RemovePathPostFixes
+# Scanning for spec files and parsing package/subpackage names, RemovePathPostFixes
+# Producing pkg_name:RemovePathPostFixes_suffix mapping string for later usage
+SOURCE_DIR=$(rpm --eval '%{_sourcedir}')
+SPEC_LIST=$(find "$SOURCE_DIR" -maxdepth 1 -name "*.spec" 2>/dev/null || :)
+if [ -z "$SPEC_LIST" ]; then
+    # If can not find any spec in _sourcedir, fallback here
+    SPEC_LIST=$(find ../../../rpmbuild/SOURCES -maxdepth 1 -name "*.spec" 2>/dev/null || :)
+fi
+# pkg_name:rpp_suffix mapping string: "pkg-A:.suffixA pkg-B:.suffixB"
+POSTFIX_MAP_STR=""
+if [ -z "$SPEC_LIST" ]; then
+    echo "No spec files found. RemovePaathPostFixes mapping failed."
+else
+    for spec in $SPEC_LIST; do
+	# Using awk for parsing spec file
+	# Name: main_pkg
+	# %package: p_name
+	# 	- without -n, p_name = main_pkg-$2
+	# RemovePathPostfixes: p_suffix
+	mappings=$(awk '{
+            cmd = toupper($1)
+            if (cmd == "NAME:") {
+                main_pkg = $2
+                current_pkg = main_pkg
+            }
+            else if (cmd == "%PACKAGE") {
+                if ($2 == "-n") {
+                    current_pkg = $3
+                } else {
+                    current_pkg = main_pkg "-" $2
+                }
+            }
+            else if (cmd == "REMOVEPATHPOSTFIXES:") {
+                print current_pkg ":" $2
+            }
+        }' "$spec")
+	if [ -n "$mappings" ]; then
+	    # attach new mapping entry to string
+            POSTFIX_MAP_STR="$POSTFIX_MAP_STR $mappings"
+        fi
+    done
+fi
+# Remove leading and trailing whitespace
+POSTFIX_MAP_STR=$(echo $POSTFIX_MAP_STR | xargs)
+# Print postfix map string
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    echo "Memory-based Postfix Map generated: $POSTFIX_MAP_STR"
+fi
+
+# Support RemovePathPostFixes, relocating files into Package-named folder. e.g.
+# copy /usr/share/toto/systemd-bootx64.efi.standalone
+# to /toto-standalone/usr/share/toto/systemd-bootx64.efi
+# Then we will package the copy to RPM_PACKAGE_NAME.cpio.rsasign archive
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    # Each entry in map string is pkg_name:p_suffix
+    for entry in $POSTFIX_MAP_STR; do
+	p_name="${entry%%:*}"
+        p_suffix="${entry#*:}"
+	# Search all files with p_suffix. e.g. .standalone
+        find "$RPM_BUILD_ROOT" -type f -name "*$p_suffix" | while read -r src_file; do
+	    # Remove the original p_suffix as new file name for copy
+            # e.g. /.../systemd-bootx64.efi.standalone -> /.../systemd-bootx64.efi
+            target_base_path="${src_file%$p_suffix}"
+	    rel_path="${target_base_path#$RPM_BUILD_ROOT}"
+	    # Add a new p_name folder behine buildroot
+            # e.g. BUILD_ROOT/usr/share/toto/ -> BUILD_ROOT/toto-standalone/usr/share/toto/
+	    target_file="$RPM_BUILD_ROOT/${p_name}${rel_path}"
+	    target_dir=$(dirname "$target_file")
+            # Run copy
+            mkdir -p "$target_dir"
+            cp -a "$src_file" "$target_file"
+        done
+    done
+fi
+
 case "$BRP_PESIGN_GRUB_RESERVATION" in
 	'')
 		pesign_grub_reservation="0"
@@ -103,6 +179,7 @@ else
 fi
 
 pushd "$RPM_BUILD_ROOT"
+# Producing the arguments of find command to pick files to .cpio.rsasign archive
 args=()
 for pattern in $files; do
 	pattern=${pattern#/}
@@ -112,7 +189,33 @@ for pattern in $files; do
 	if test -d "$pattern"; then
 		pattern="$pattern/*"
 	fi
-	args=("${args[@]}" -o -path "$pattern")
+	# Support RemovePathPostFixes, check the pattern matches with any
+	# suffix in Postfix Map file. If so, then we package the copy file
+	# in /pkg_name to $RPM_PACKAGE_NAME.cpio.rsasign archive. e.g.
+	# /toto-standalone/usr/share/toto/systemd-bootx64.efi
+	# instead of
+	# /usr/share/toto/systemd-bootx64.efi.standalone
+        shifted_match=""
+	if [ -n "$POSTFIX_MAP_STR" ]; then
+	    for entry in $POSTFIX_MAP_STR; do
+		p_name="${entry%%:*}"
+		p_suffix="${entry#*:}"
+		# If current pattern matches with suffix
+		if [[ "$pattern" == *"$p_suffix" ]]; then
+		    base_path="${pattern%$p_suffix}"
+		    rel_base_path="${base_path#./}"
+		    shifted_match="./${p_name}/${rel_base_path}"
+                    break
+		fi
+	    done
+	fi
+        if [ -z "$shifted_match" ]; then
+	    # Case A: no match, keep using original file pattern
+            args=("${args[@]}" -o -path "$pattern")
+        else
+	    # Case B: match, using shifted match pattern
+            args=("${args[@]}" -o -path "$shifted_match")
+        fi
 done
 # delete the leading -o
 unset args[0]
@@ -152,11 +255,25 @@ if [ "$nfiles" != 0 ] ; then
 fi
 rm -rf "$archive_dir"
 
+# Removing temporary suffix package folders and its files before primary build
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    for entry in $POSTFIX_MAP_STR; do
+	p_name="${entry%%:*}"
+	# Delete the $p_name/ folder located directly under the build root
+	find "$RPM_BUILD_ROOT" -maxdepth 1 -type d -name "${p_name}" -exec rm -rf {} +
+    done
+fi
+
 if [ "$nfiles" = 0 ] ; then
 echo "No files in $archive, giving up"
 	exit 0
 fi
 popd
+
+# Show the content in .cpio.rsasign archive for debugging
+if [ -f "$archive" ]; then
+    cpio -it < "$archive" | sed 's/^/DEBUG: [CPIO] /'
+fi
 
 if test -e $RPM_SOURCE_DIR/pesign-spec-macros; then
 	sed "
@@ -179,6 +296,12 @@ if test -e $RPM_SOURCE_DIR/pesign-copy-sources; then
 	rm $output/pesign-copy-sources
 fi
 
+# Collect all RemovePathPostFixes (RPP) pkg_names for sending to next stage
+RPP_PACKAGES=""
+if [ -n "$POSTFIX_MAP_STR" ]; then
+    RPP_PACKAGES=$(echo "$POSTFIX_MAP_STR" | awk 'BEGIN{RS=" "; FS=":"} {print $1}' | xargs)
+fi
+echo "RPP_PACKAGES: $RPP_PACKAGES"
 
 sed "
 	s:@NAME@:$RPM_PACKAGE_NAME:g
@@ -186,6 +309,7 @@ sed "
 	s:@PESIGN_REPACKAGE_COMPRESS@:$pesign_repackage_compress:g
 	s:@PESIGN_LOAD_SPEC_MACROS@:$spec_macros:g
 	s:@PESIGN_PACKAGES@:$packages:g
+	s:@RPP_PACKAGES@:$RPP_PACKAGES:g
 	/@CERT@/ {
 		r $cert
 		d

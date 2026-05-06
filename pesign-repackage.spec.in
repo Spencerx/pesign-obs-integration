@@ -52,6 +52,10 @@ Spec file to rebuild RPMs with signatures
 # avoid loops
 export BRP_PESIGN_FILES=""
 
+RPP_rpms=(@RPP_PACKAGES@)
+echo "Extracted RemovePathPostFixes packages array:"
+declare -p RPP_rpms
+
 pushd %buildroot
 disturl=
 rpms_filter=@PESIGN_PACKAGES@
@@ -85,7 +89,26 @@ for rpm in %_sourcedir/*.rpm; do
 		cp "$rpm" "$_"
 		continue
 	fi
-	rpm2cpio "$rpm" | cpio -idm
+	# Check if package name is in RPP list
+        p_name=$(rpm -qp --qf '%%{NAME}' "$rpm")
+        is_postfix_pkg=0
+	for rpp_rpm in "${RPP_rpms[@]}"; do
+	    if [ "$p_name" = "$rpp_rpm" ]; then
+		is_postfix_pkg=1
+		break
+	    fi
+	done
+        if [ "$is_postfix_pkg" -eq 1 ]; then
+	    echo "[Unpack] Special handling for postfix package: $p_name"
+            mkdir -p "$p_name"
+            # Decompress RPM to a folder with the name of the package
+	    # It can avoid any file conflict with other packages
+            (cd "$p_name" && rpm2cpio "$rpm" | cpio -idm)
+        else
+            # Unpack normal package
+	    # Direct decompress it to BUILDROOT
+            rpm2cpio "$rpm" | cpio -idm
+        fi
 	d=$(rpm -qp --qf '%%{disturl}' "$rpm")
 	if test -z "$disturl"; then
 		disturl=$d
@@ -129,6 +152,19 @@ fi
 mkdir rsasigned
 pushd rsasigned
 cpio -idm <%_sourcedir/@NAME@.cpio.rsasign.sig
+
+# Extracting all sattrs metadata from CPIO before we handling _RPP_ folder
+find . -type f \( \
+    -path "*/boot/*.sig" -o \
+    -name "*.efi.sig" -o \
+    -name "vmlinu[xz].sig" -o \
+    -name "[Ii]mage.sig" -o \
+    -name "z[Ii]mage.sig" \
+\) | while read -r sig_path; do
+    infile_entry="${sig_path%.sig}"
+    cpio -i --to-stdout "${infile_entry#./}" < %_sourcedir/@NAME@.cpio.rsasign > "${infile_entry}.sattrs" 2>/dev/null
+done
+
 cat >cert.crt <<EOF
 @CERT@
 EOF
@@ -161,6 +197,8 @@ for sig in "${sigs[@]}"; do
 		echo "$sig signature can not be decrypted by $cert" >&2
 		exit 1
 	fi
+	# Estimate the target file path $f based on the signature file path .sig
+	# The siganture will be attached to target file in the later against different format
 	f=%buildroot/${sig%.sig}
 	case "/$sig" in
 	*.ko.sig|*.mod.sig)
@@ -180,7 +218,6 @@ for sig in "${sigs[@]}"; do
 %ifarch %ix86 x86_64 aarch64 %arm riscv64 loongarch64
 		# PE style signature injection
 		infile=${sig%.sig}
-		cpio -i --to-stdout ${infile#./} <%_sourcedir/@NAME@.cpio.rsasign > ${infile}.sattrs
 		test -s ${infile}.sattrs || exit 1
 		ohash=$(pesign -n "$nss_db" -h -P -i "$f")
 		pesign -n "$nss_db" -c cert -i "$f" -o "$f.tmp" -d sha256 -I "${infile}.sattrs" -R "$sig"
@@ -195,11 +232,18 @@ for sig in "${sigs[@]}"; do
 		# appending to the file itself, e.g. for s390x.
 		/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
 %endif
-		# Regenerate the HMAC if it exists
-		hmac="${f%%/*}/.${f##*/}.hmac"
-		if test -e "$hmac"; then
-			/usr/lib/rpm/pesign/gen-hmac -r %buildroot "/${sig%.sig}"
-		fi
+		# Regenerate the kernel's HMAC in target file's folder
+                f_dir=$(dirname "$f")
+                f_name=$(basename "$f")
+                hmac_file="$f_dir/.$f_name.hmac"
+                if [ -e "$hmac_file" ]; then
+			# The $BUILDROOT in tareget file path should be removed for gen-hmac
+                        # e.g. We want: /toto-standalone/usr/lib/modules/.../vmlinuz
+                        rel_f_path="${f#%buildroot}"
+                        [[ "$rel_f_path" != /* ]] && rel_f_path="/$rel_f_path"
+                        /usr/lib/rpm/pesign/gen-hmac -r %buildroot "$rel_f_path"
+                        echo "[HMAC] Regenerated for $rel_f_path"
+                fi
 		;;
 	*stage3.bin.sig)
 		/usr/lib/rpm/pesign/kernel-sign-file -i pkcs7 -s "$sig" sha256 "$cert" "$f"
@@ -233,9 +277,34 @@ done
 # Remove the public key file
 rm "$cert.pub"
 
+# Preparing buildroot for repackaging stage
+
+# Recovery. Move RPP files to buildroot/*/*/*.pkg_name and remove
+# buildroot/pkg_name/ namespace folder. The RemovePathPostFixes in
+# repackage.spec will handle it. e.g.
+# %{buildroot}/toto-standalone/usr/lib/modules/vmlinuz
+# move back to
+# %{buildroot}/usr/lib/modules/vmlinuz.toto-standalone
+for p_name in "${RPP_rpms[@]}"; do
+    p_root="%{buildroot}/$p_name"
+    if [ -d "$p_root" ]; then
+        echo "Processing RPP package: $p_name"
+	# handling buildroot/pkg_name namespace folder
+        find "$p_root" -type f | while read -r src_file; do
+            rel_path="${src_file#$p_root/}"
+            dest_file="%{buildroot}/${rel_path}.${p_name}"
+            mkdir -p "$(dirname "$dest_file")"
+            mv "$src_file" "$dest_file"
+        done
+        rm -rf "$p_root"
+    fi
+done
+# Transfer RPP rpms array to CSV string for pesign-gen-repackage-spec perl script
+RPP_PKGS=$(IFS=,; echo "${RPP_rpms[*]}")
+
 popd
 /usr/lib/rpm/pesign/pesign-gen-repackage-spec @PESIGN_REPACKAGE_COMPRESS@ @PESIGN_LOAD_SPEC_MACROS@ \
-	--directory=%buildroot "${rpms[@]}"
+	--directory=%buildroot --rpp-pkgs="$RPP_PKGS" "${rpms[@]}"
 
 # For some reason in Fedora/CentOS builds the directory structure is different from SUSE,
 # which breaks repacking. Copy the package content to the buildroot that is actually used.
