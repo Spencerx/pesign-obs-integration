@@ -151,9 +151,21 @@ for module in $(find "$buildroot" -type f -name '*.ko.*' -printf '%P\n'); do
 			echo "$orig_module.sig not found in $sig_dir" >&2
 			exit 1
 		fi
-		ver_err=$(openssl rsautl -verify -inkey "$cert.pub" -pubin -in "$raw_sig" 2>&1 | grep -i error)
-		if [ -n "$ver_err" ]; then
-			echo "$raw_sig signature can not be decrypted by $cert" >&2
+		status=0
+		output=$(openssl rsautl -verify -inkey "$cert.pub" -pubin -in "$raw_sig" 2>/dev/null | xxd -p -c 256)
+		status=${PIPESTATUS[0]}
+		if [ "$status" -ne 0 ]; then
+			echo "$raw_sig signature can not be decrypted by $cert, exit code: $status, output: $output" >&2
+			exit 1
+		fi
+		# check error wording in output
+		if echo "$output" | xxd -r -p | grep -iq "error"; then
+			echo "$raw_sig signature can not be decrypted by $cert, output: $output" >&2
+			exit 1
+		fi
+		# A PKCS#7 packet must encapsulate a DigestInfo in ASN.1 format
+		if ! echo "$output" | xxd -r -p | openssl asn1parse -inform der > /dev/null 2>&1; then
+			echo "$raw_sig signature is not a DigestInfo in ASN.1 format for a PKCS#7" >&2
 			exit 1
 		fi
 		/usr/lib/rpm/pesign/kernel-sign-file \
